@@ -1,0 +1,38 @@
+services:
+  bot:
+    build: .
+    image: discord-welcome-bot:latest
+    container_name: discord-welcome-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /app/data/bot_data.db
+      LOG_LEVEL: INFO
+    volumes:
+      - ./data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Resource limits (compose v2)
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    # Also apply at container level so it works without Swarm
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
