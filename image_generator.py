@@ -1,6 +1,5 @@
 # image_generator.py
 import asyncio
-import hashlib
 import io
 import math
 import random
@@ -9,21 +8,22 @@ from functools import lru_cache
 import discord
 from PIL import Image, ImageDraw, ImageFont
 
-from config import FONT_BOLD, FONT_REGULAR
+from config import FONT_BOLD, FONT_DISPLAY, FONT_SERIF, FONT_TYPEWRITER
 
-W, H = 1100, 680
+W, H = 1100, 694
 
-NAVY      = (22, 42, 78)
-NAVY_MID  = (40, 65, 115)
-BG_CREAM  = (248, 246, 240)
-TEXT_DARK = (30, 30, 40)
-WHITE     = (255, 255, 255)
+BLUE   = (0, 35, 135)
+GOLD   = (226, 178, 40)
+BLACK  = (12, 12, 16)
+WHITE  = (255, 255, 255)
+
+TITLE = "FELLAS BEING IDIOTS"
 
 
 # ── Fonts (cached) ──
 @lru_cache(maxsize=128)
-def _load_font(path: str, size: int):
-    for p in (path,
+def _font(path: str, size: int):
+    for p in (path, FONT_BOLD,
               "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
               "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"):
         try:
@@ -33,276 +33,359 @@ def _load_font(path: str, size: int):
     return ImageFont.load_default()
 
 
-@lru_cache(maxsize=32)
-def _load_serif(size: int):
-    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-              "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"):
-        try:
-            return ImageFont.truetype(p, size)
-        except Exception:
-            continue
-    return _load_font(FONT_BOLD, size)
+def _display(size): return _font(FONT_DISPLAY, size)
+def _type(size):    return _font(FONT_TYPEWRITER, size)
+def _serif(size):   return _font(FONT_SERIF, size)
 
 
-# ── Guilloche background (cached) ──
+def _fit(text, font_fn, max_w, max_size, min_size=14):
+    """Largest font (<= max_size) whose text width fits max_w."""
+    tmp = ImageDraw.Draw(Image.new("L", (1, 1)))
+    for size in range(max_size, min_size - 1, -2):
+        f = font_fn(size)
+        b = tmp.textbbox((0, 0), text, font=f)
+        if b[2] - b[0] <= max_w:
+            return f
+    return font_fn(min_size)
+
+
+def _text(draw, text, font, x, top, fill, align="l"):
+    """Draw text so the glyph box's top edge sits at `top` (x = left/centre/right)."""
+    b = draw.textbbox((0, 0), text, font=font)
+    w = b[2] - b[0]
+    if align == "c":
+        x = x - w // 2
+    elif align == "r":
+        x = x - w
+    draw.text((x - b[0], top - b[1]), text, font=font, fill=fill)
+    return b[3] - b[1]
+
+
+def _tracked(draw, text, font, cx, top, fill, total_w):
+    """Centre text, stretching letter-spacing so it spans total_w."""
+    adv = [draw.textlength(c, font=font) for c in text]
+    track = (total_w - sum(adv)) / max(len(text) - 1, 1)
+    x = cx - total_w / 2
+    off = font.getbbox("H")[1]
+    for ch, a in zip(text, adv):
+        draw.text((x, top - off), ch, font=font, fill=fill)
+        x += a + track
+
+
+def _spaced(draw, text, font, x, y, fill, track=3):
+    for ch in text:
+        draw.text((x, y), ch, font=font, fill=fill)
+        x += draw.textlength(ch, font=font) + track
+
+
+# ── Guilloche security background (cached) ──
 _bg_cache: dict[tuple[int, int], Image.Image] = {}
 
 
-def _guilloche_background(w: int, h: int) -> Image.Image:
-    base = Image.new("RGB", (w, h), BG_CREAM)
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(overlay)
+def _guilloche(w, h):
+    """Near-white security paper: grey lattice ribbon (top), soft wave ribbons
+    (middle) and a dense blue-teal weave (bottom). Drawn at 2x, then downsampled."""
+    k = 2
+    W2, H2 = w * k, h * k
+    base = Image.new("RGB", (W2, H2), (246, 247, 249))
+    ov = Image.new("RGBA", (W2, H2), (0, 0, 0, 0))
+    d = ImageDraw.Draw(ov)
 
-    for spacing in range(-20, h + 20, 16):
-        pts = []
-        for x in range(0, w, 2):
-            y = spacing + 9 * math.sin(x / 45 + spacing / 22)
-            if -5 <= y <= h + 5:
-                pts.append((x, int(y)))
-        if len(pts) > 1:
-            d.line(pts, fill=(160, 170, 190, 45), width=1)
+    def line(pts, col, width=2):
+        d.line([(x * k, y * k) for x, y in pts], fill=col, width=width)
 
-    for spacing in range(-w, w + h, 22):
-        pts = []
-        for x in range(0, w, 2):
-            y = (spacing - x * 0.5) + 7 * math.sin(x / 55 + spacing / 30)
-            if -5 <= y <= h + 5:
-                pts.append((x, int(y)))
-        if len(pts) > 1:
-            d.line(pts, fill=(150, 160, 185, 30), width=1)
+    xs = list(range(-10, w + 12, 3))
 
-    return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+    # 1) lattice ribbon between two wavy envelopes (zigzag mesh)
+    def lattice(top_fn, bot_fn, step, col, reach=14):
+        for x0 in range(-40, w + 40, step):
+            for dx in (-reach, reach):
+                d.line([(x0 * k, top_fn(x0) * k), ((x0 + dx) * k, bot_fn(x0 + dx) * k)],
+                       fill=col, width=1)
+                d.line([(x0 * k, bot_fn(x0) * k), ((x0 + dx) * k, top_fn(x0 + dx) * k)],
+                       fill=col, width=1)
+
+    lattice(lambda x: 10 + 7 * math.sin(x / 75),
+            lambda x: 100 + 18 * math.sin(x / 95 + 1.0), 9, (140, 140, 160, 235), reach=16)
+    # faint hatch behind the seal / centre
+    lattice(lambda x: 120 + 10 * math.sin(x / 120 + 2),
+            lambda x: 340 + 14 * math.sin(x / 110), 12, (175, 178, 195, 70), reach=9)
+
+    # bottom diamond mesh across the full width
+    lattice(lambda x: 440 + 16 * math.sin(x / 85),
+            lambda x: 700 + 8 * math.sin(x / 100 + 1), 10, (135, 180, 205, 120), reach=13)
+
+    # 2) smooth pale wave ribbons (outlines)
+    for base_y, amp, ph, col in ((395, 22, 0.0, (170, 176, 192, 170)),
+                                 (432, 26, 0.5, (170, 176, 192, 150)),
+                                 (470, 24, 1.1, (125, 168, 196, 140))):
+        for off in (0, 7):
+            line([(x, base_y + off + amp * math.sin(x / 120 + ph)) for x in xs],
+                 col, 1)
+
+    # 3) dense blue-teal weave: fans of fast sines riding slow waves
+    def fan(cy, amp, slow_amp, slow_f, fast_f, n, step, col, ph0=0.0):
+        for i in range(n):
+            ph = ph0 + i * step
+            pts = []
+            for x in xs:
+                env = 0.55 + 0.45 * math.sin(x / 170 + ph0 + 1.2)
+                y = (cy + slow_amp * math.sin(x * slow_f + ph0)
+                     + amp * env * math.sin(x * fast_f + ph))
+                pts.append((x, y))
+            line(pts, col, 1)
+
+    BL = (85, 145, 185, 235)
+    fan(575, 40, 48, 1 / 48, 1 / 6, 18, 0.33, BL, 0.0)
+    fan(540, 34, 44, 1 / 48, 1 / 7, 14, 0.4, (100, 155, 190, 200), 1.4)
+    fan(650, 26, 26, 1 / 42, 1 / 5.5, 14, 0.4, BL, 2.2)
+    fan(470, 22, 34, 1 / 55, 1 / 6.5, 10, 0.5, (110, 160, 192, 170), 0.8)
+
+    out = Image.alpha_composite(base.convert("RGBA"), ov)
+    return out.resize((w, h), Image.LANCZOS)
 
 
-def _get_background(w: int, h: int) -> Image.Image:
+def _get_background(w, h):
     key = (w, h)
     if key not in _bg_cache:
-        _bg_cache[key] = _guilloche_background(w, h)
+        _bg_cache[key] = _guilloche(w, h)
     return _bg_cache[key].copy()
 
 
 # ── Helpers ──
-def _circle_mask(size: int):
-    m = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(m).ellipse((0, 0, size - 1, size - 1), fill=255)
-    return m
+def _star(draw, cx, cy, r, fill):
+    pts = []
+    for i in range(10):
+        a = -math.pi / 2 + i * math.pi / 5
+        rr = r if i % 2 == 0 else r * 0.42
+        pts.append((cx + rr * math.cos(a), cy + rr * math.sin(a)))
+    draw.polygon(pts, fill=fill)
 
 
-def _to_circle(img: Image.Image, size: int) -> Image.Image:
-    img = img.convert("RGBA").resize((size, size), Image.LANCZOS)
-    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    out.paste(img, (0, 0), _circle_mask(size))
-    return out
+def _arc_text(img, text, cx, cy, radius, font, fill, top=True, gap=2):
+    tmp_d = ImageDraw.Draw(Image.new("L", (1, 1)))
+    adv = [tmp_d.textlength(c, font=font) + gap for c in text]
+    span = sum(adv) / radius
+    ang = -math.pi / 2 - span / 2 if top else math.pi / 2 + span / 2
+    T = int(font.size * 2)
+    for ch, a in zip(text, adv):
+        th = ang + a / radius / 2 if top else ang - a / radius / 2
+        x, y = cx + radius * math.cos(th), cy + radius * math.sin(th)
+        tile = Image.new("RGBA", (T, T), (0, 0, 0, 0))
+        ImageDraw.Draw(tile).text((T // 2, T // 2), ch, font=font, fill=fill, anchor="mm")
+        deg = math.degrees(th)
+        tile = tile.rotate(-(deg + 90) if top else -(deg - 90), resample=Image.BICUBIC)
+        img.paste(tile, (int(x - T / 2), int(y - T / 2)), tile)
+        ang = ang + a / radius if top else ang - a / radius
 
 
-def _code_seed(code: str) -> int:
-    return int(hashlib.md5(code.encode()).hexdigest()[:8], 16)
+def _leaf(d, x, y, ang, length, width, fill, outline):
+    pts = []
+    for i in range(0, 21):
+        t = i / 20
+        pts.append((t * length, width / 2 * math.sin(math.pi * t) ** 0.8))
+    for i in range(20, -1, -1):
+        t = i / 20
+        pts.append((t * length, -width / 2 * math.sin(math.pi * t) ** 0.8))
+    ca, sa = math.cos(ang), math.sin(ang)
+    d.polygon([(x + px * ca - py * sa, y + px * sa + py * ca) for px, py in pts],
+              fill=fill, outline=outline)
 
 
-def _draw_barcode(canvas: Image.Image, x: int, y: int, w: int, h: int, seed: int):
-    rng = random.Random(seed)
-    d = ImageDraw.Draw(canvas)
+def _laurel(d, mirror):
+    def bez(t):
+        p0, p1, p2 = (268, 420), (205, 350), (262, 258)
+        return ((1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t * t * p2[0],
+                (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t * t * p2[1])
+    m = (lambda x: 700 - x) if mirror else (lambda x: x)
+    stem = [(m(bez(i / 30)[0]), bez(i / 30)[1]) for i in range(31)]
+    d.line(stem, fill=(30, 100, 50), width=4)
+    greens = [((52, 150, 78), (20, 80, 40)), ((34, 112, 58), (16, 70, 36))]
+    for n, t in enumerate([0.08, 0.2, 0.32, 0.45, 0.58, 0.71, 0.84]):
+        x, y = bez(t)
+        x2, y2 = bez(t + 0.02)
+        tang = math.atan2(y2 - y, x2 - x)
+        for side in (-1, 1):
+            a = tang + side * 0.72
+            if mirror:
+                a = math.pi - a
+            f, o = greens[(n + (side > 0)) % 2]
+            _leaf(d, m(x), y, a, 58, 26, f, o)
+    x, y = bez(1.0)
+    tang = math.atan2(bez(1.0)[1] - bez(0.97)[1], bez(1.0)[0] - bez(0.97)[0])
+    a = math.pi - tang if mirror else tang
+    _leaf(d, m(x), y, a, 54, 24, greens[0][0], greens[0][1])
+
+
+@lru_cache(maxsize=1)
+def _build_seal(size: int = 270) -> Image.Image:
+    """Original emblem: gold spiked rim, navy disc, ring text, 13 stars,
+    striped shield with scales, laurels and a motto banner."""
+    k = 2
+    S = 700 * k
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    c = 350 * k
+
+    def P(r, a):
+        return (c + r * k * math.cos(a), c + r * k * math.sin(a))
+
+    # spiked rim: back row (darker) then front row, each spike two-toned
+    for n, rows in ((22, (318, 282, (196, 142, 12), (232, 178, 24), 0.5)),
+                    (22, (350, 300, (222, 168, 14), (255, 218, 52), 0.0))):
+        tip, base, dark, light, off = rows
+        for i in range(n):
+            a = (i + off) * 2 * math.pi / n
+            half = math.pi / n
+            tp, bl, br, mid = P(tip, a), P(base, a - half), P(base, a + half), P(base - 2, a)
+            d.polygon([tp, bl, mid], fill=light)
+            d.polygon([tp, mid, br], fill=dark)
+
+    d.ellipse([c - 312 * k, c - 312 * k, c + 312 * k, c + 312 * k], fill=(244, 200, 40))
+    d.ellipse([c - 302 * k, c - 302 * k, c + 302 * k, c + 302 * k], fill=(18, 56, 145))
+    for r, w in ((290, 5), (226, 5)):
+        d.ellipse([c - r * k, c - r * k, c + r * k, c + r * k],
+                  outline=(244, 204, 50), width=w * k)
+
+    # ring text
+    f = ImageFont.truetype(FONT_SERIF, 54 * k)
+    _arc_text(img, "DEPARTMENT OF IDIOCY", c, c, 258 * k, f, WHITE, top=True, gap=5 * k)
+    _arc_text(img, "FELLAS BEING IDIOTS", c, c, 258 * k, f, WHITE, top=False, gap=5 * k)
+
+    # 13 stars
+    for i in range(13):
+        a = -math.pi / 2 + i * 2 * math.pi / 13
+        x, y = P(198, a)
+        _star(d, x, y, 24 * k, (252, 212, 46))
+
+    # laurels
+    big = Image.new("RGBA", (700, 700), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(big)
+    _laurel(bd, False)
+    _laurel(bd, True)
+
+    # shield (body with stripes, gold chief, scales)
+    body = [(282, 272), (418, 272), (418, 372), (350, 416), (282, 372)]
+    mask = Image.new("L", (700, 700), 0)
+    ImageDraw.Draw(mask).polygon(body, fill=255)
+    stripes = Image.new("RGBA", (700, 700), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(stripes)
+    sw = 136 / 5
+    for i in range(5):
+        col = (206, 22, 62) if i % 2 == 0 else (250, 250, 250)
+        sd.rectangle([282 + i * sw, 260, 282 + (i + 1) * sw, 420], fill=col)
+    big.paste(stripes, (0, 0), mask)
+    bd.polygon(body, outline=(235, 235, 235))
+    bd.line(body + [body[0]], fill=(235, 235, 235), width=3)
+    bd.polygon([(292, 230), (408, 230), (418, 244), (418, 274), (282, 274), (282, 244)],
+               fill=(248, 200, 40), outline=(235, 235, 235))
+    navy = (20, 50, 120)
+    bd.line([(350, 238), (350, 262)], fill=navy, width=4)
+    bd.ellipse([345, 233, 355, 243], outline=navy, width=3)
+    bd.line([(306, 250), (394, 250)], fill=navy, width=4)
+    for sx in (312, 388):
+        bd.line([(sx, 250), (sx - 11, 266)], fill=navy, width=2)
+        bd.line([(sx, 250), (sx + 11, 266)], fill=navy, width=2)
+        bd.pieslice([sx - 12, 254, sx + 12, 278], 0, 180, fill=navy)
+
+    # motto banner
+    paper, edge = (251, 249, 241), (140, 140, 140)
+    def quad(pts, text, ang, fx, fy, fs):
+        bd.polygon(pts, fill=paper, outline=edge)
+        t = Image.new("RGBA", (260, 70), (0, 0, 0, 0))
+        ImageDraw.Draw(t).text((130, 35), text, font=ImageFont.truetype(FONT_SERIF, fs),
+                               fill=(30, 30, 50), anchor="mm")
+        t = t.rotate(ang, resample=Image.BICUBIC, expand=True)
+        big.paste(t, (int(fx - t.width / 2), int(fy - t.height / 2)), t)
+    quad([(206, 412), (318, 434), (322, 482), (214, 458)], "FIDELITY", -10.5, 258, 448, 18)
+    quad([(494, 412), (382, 434), (378, 482), (486, 458)], "INTEGRITY", 10.5, 442, 448, 18)
+    quad([(306, 448), (394, 448), (396, 492), (304, 492)], "BRAVERY", 0, 350, 470, 18)
+
+    base = img.resize((size, size), Image.LANCZOS)
+    top = big.resize((size, size), Image.LANCZOS)
+    return Image.alpha_composite(base, top)
+
+
+def _paste_seal(card, cx, cy, size=270):
+    seal = _build_seal(size)
+    card.paste(seal, (cx - size // 2, cy - size // 2), seal)
+
+
+def _draw_barcode(draw, x, y, w, h, code):
+    rng = random.Random(code)
     cur = x
     while cur < x + w:
-        bw = rng.choice([1, 2, 2, 3, 3, 4])
-        if cur + bw > x + w:
-            bw = x + w - cur
-        if rng.random() > 0.35:
-            d.rectangle([cur, y, cur + bw - 1, y + h], fill=(10, 10, 15))
-        cur += bw + rng.choice([1, 2])
-    d.rectangle([x, y, x + w, y + h], outline=(80, 80, 90), width=1)
-
-
-def _draw_vertical_text(canvas, text, center_x, center_y, font, fill, gap=1):
-    tiles = []
-    for ch in text:
-        tmp = Image.new("RGBA", (1, 1))
-        bbox = ImageDraw.Draw(tmp).textbbox((0, 0), ch, font=font)
-        cw, ch_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        tile = Image.new("RGBA", (max(cw, 4), ch_h + 4), (0, 0, 0, 0))
-        ImageDraw.Draw(tile).text((0 - bbox[0], 2 - bbox[1]), ch, font=font, fill=fill)
-        tiles.append(tile)
-    total_h = sum(t.height for t in tiles) + gap * (len(tiles) - 1)
-    y = center_y - total_h // 2
-    for t in tiles:
-        canvas.paste(t, (center_x - t.width // 2, y), t)
-        y += t.height + gap
-
-
-def _wrap_text(text, font, max_width, draw):
-    lines, current = [], ""
-    for word in text.split():
-        test = (current + " " + word).strip()
-        bbox = draw.textbbox((0, 0), test, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines
-
-
-def _fit_name(name, max_width, draw, base_size=32, min_size=13):
-    size = base_size
-    while size > min_size:
-        font = _load_font(FONT_BOLD, size)
-        bbox = draw.textbbox((0, 0), name, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            return font, bbox
-        size -= 1
-    font = _load_font(FONT_BOLD, min_size)
-    return font, draw.textbbox((0, 0), name, font=font)
-
-
-def _fallback_logo(guild_name: str) -> Image.Image:
-    img = Image.new("RGB", (512, 512), (40, 55, 90))
-    d = ImageDraw.Draw(img)
-    initial = (guild_name[:1] or "S").upper()
-    font = _load_serif(280)
-    bbox = d.textbbox((0, 0), initial, font=font)
-    d.text((256 - (bbox[2] - bbox[0]) // 2,
-            256 - (bbox[3] - bbox[1]) // 2 - bbox[1]), initial, font=font, fill=WHITE)
-    return img
-
-
-def _draw_seal(card, server_logo, cx, cy, radius, guild_name):
-    draw = ImageDraw.Draw(card)
-    draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], outline=NAVY, width=3)
-    draw.ellipse([cx - radius + 3, cy - radius + 3, cx + radius - 3, cy + radius - 3], outline=NAVY, width=1)
-    inner = radius - 24
-    draw.ellipse([cx - inner, cy - inner, cx + inner, cy + inner], outline=NAVY, width=2)
-    inner2 = inner - 4
-    draw.ellipse([cx - inner2, cy - inner2, cx + inner2, cy + inner2], outline=NAVY, width=1)
-
-    ring_text = (guild_name.upper()[:26] + "   •   ")[:34]
-    font_ring = _load_font(FONT_BOLD, 12)
-    n = len(ring_text)
-    tr = radius - 13
-    for i, ch in enumerate(ring_text):
-        angle = -math.pi / 2 + (i / n) * 2 * math.pi
-        chx = cx + tr * math.cos(angle)
-        chy = cy + tr * math.sin(angle)
-        tmp = Image.new("RGBA", (40, 40), (0, 0, 0, 0))
-        ImageDraw.Draw(tmp).text((20, 20), ch, font=font_ring, fill=NAVY, anchor="mm")
-        rot = math.degrees(angle) + 90
-        rotated = tmp.rotate(-rot, resample=Image.BICUBIC)
-        card.paste(rotated, (int(chx - 20), int(chy - 20)), rotated)
-
-    logo_size = inner2 * 2 - 8
-    logo_c = _to_circle(server_logo, logo_size)
-    card.paste(logo_c, (cx - logo_size // 2, cy - logo_size // 2), logo_c)
+        bw = rng.choice([2, 2, 3, 3, 4, 5])
+        bw = min(bw, x + w - cur)
+        draw.rectangle([cur, y, cur + bw - 1, y + h], fill=BLACK)
+        cur += bw + rng.choice([2, 3, 3, 4])
 
 
 # ── Synchronous renderer (runs in thread) ──
-def _render_card(avatar_bytes: bytes | None, logo_bytes: bytes | None,
-                 guild_name: str, display_name: str, code: str,
-                 member_id: int) -> bytes:
-    avatar_img = (Image.open(io.BytesIO(avatar_bytes)).convert("RGB")
-                  if avatar_bytes else Image.new("RGB", (512, 512), (120, 120, 130)))
-    server_logo = (Image.open(io.BytesIO(logo_bytes)).convert("RGB")
-                   if logo_bytes else _fallback_logo(guild_name))
+def _render_card(avatar_bytes, logo_bytes, guild_name, display_name, code, member_id):
+    avatar = (Image.open(io.BytesIO(avatar_bytes)).convert("RGB")
+              if avatar_bytes else Image.new("RGB", (512, 512), (120, 130, 150)))
 
-    card = _get_background(W, H).convert("RGBA")
-    draw = ImageDraw.Draw(card)
+    card = _get_background(W, H)
+    d = ImageDraw.Draw(card)
 
-    draw.rectangle([12, 12, W - 12, H - 12], outline=NAVY, width=3)
-    draw.rectangle([20, 20, W - 20, H - 20], outline=NAVY, width=1)
-    for (x, y, dx, dy) in [(12, 12, 1, 1), (W - 12, 12, -1, 1),
-                            (12, H - 12, 1, -1), (W - 12, H - 12, -1, -1)]:
-        draw.line([(x, y), (x + 40 * dx, y)], fill=NAVY, width=4)
-        draw.line([(x, y), (x, y + 40 * dy)], fill=NAVY, width=4)
+    # Title (full width, heavy condensed)
+    _tracked(d, TITLE, _display(100), W // 2, 20, BLUE, 940)
 
-    f_header = _load_font(FONT_BOLD, 28)
-    f_sub    = _load_font(FONT_BOLD, 14)
-    f_sa     = _load_font(FONT_BOLD, 22)
-    f_cert   = _load_font(FONT_REGULAR, 12)
-    f_code   = _load_font(FONT_BOLD, 20)
-    f_vert   = _load_font(FONT_BOLD, 15)
-    f_tiny   = _load_font(FONT_REGULAR, 10)
-
-    # Header
-    header = "FELLAS BEING IDIOTS"
-    bbox = draw.textbbox((0, 0), header, font=f_header)
-    draw.text(((W - (bbox[2] - bbox[0])) // 2, 32), header, font=f_header, fill=NAVY)
-    sub = "FELLAS BEING IDIOTS DISCORD COMMUNITY"
-    bbox = draw.textbbox((0, 0), sub, font=f_sub)
-    draw.text(((W - (bbox[2] - bbox[0])) // 2, 68), sub, font=f_sub, fill=NAVY_MID)
-    draw.line([(40, 96), (W - 40, 96)], fill=NAVY, width=2)
-    draw.line([(40, 100), (W - 40, 100)], fill=NAVY, width=1)
-
-    # Large FBI
-    f_letters = _load_serif(200)
-    bbox = draw.textbbox((0, 0), "FBI", font=f_letters)
-    lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    layer = Image.new("RGBA", (lw + 20, lh + 20), (0, 0, 0, 0))
-    ImageDraw.Draw(layer).text((10 - bbox[0], 10 - bbox[1]), "FBI",
-                               font=f_letters, fill=(*NAVY, 230))
-    card.paste(layer, (400 - lw // 2, 285 - lh // 2), layer)
+    # Big acronym
+    _text(d, "FBI", _display(288), 455, 132, BLUE, "c")
 
     # Seal
-    _draw_seal(card, server_logo, cx=155, cy=310, radius=95, guild_name=guild_name)
-    cap = "FIELD OFFICE"
-    bbox = draw.textbbox((0, 0), cap, font=f_tiny)
-    draw.text((155 - (bbox[2] - bbox[0]) // 2, 415), cap, font=f_tiny, fill=NAVY_MID)
+    _paste_seal(card, 160, 268)
 
-    # Photo
-    px, py, pw, ph = 780, 128, 210, 250
-    draw.rectangle([px - 6, py - 6, px + pw + 6, py + ph + 6], outline=NAVY, width=4)
-    draw.rectangle([px - 2, py - 2, px + pw + 2, py + ph + 2], outline=NAVY_MID, width=1)
-    ar = avatar_img.width / avatar_img.height
+    # Photo: blue frame, white mat
+    fx0, fy0, fx1, fy1 = 648, 118, 958, 494
+    d.rectangle([fx0, fy0, fx1, fy1], fill=BLUE)
+    d.rectangle([fx0 + 10, fy0 + 10, fx1 - 10, fy1 - 10], fill=WHITE)
+    pw, ph = fx1 - fx0 - 36, fy1 - fy0 - 36
+    ar = avatar.width / avatar.height
     if ar > pw / ph:
-        new_h = ph
-        new_w = int(ph * ar)
-        photo = avatar_img.resize((new_w, new_h), Image.LANCZOS).crop(
-            ((new_w - pw) // 2, 0, (new_w - pw) // 2 + pw, ph))
+        nh, nw = ph, int(ph * ar)
     else:
-        new_w = pw
-        new_h = int(pw / ar)
-        photo = avatar_img.resize((new_w, new_h), Image.LANCZOS).crop(
-            (0, (new_h - ph) // 2, pw, (new_h - ph) // 2 + ph))
-    card.paste(photo, (px, py))
+        nw, nh = pw, int(pw / ar)
+    photo = avatar.resize((nw, nh), Image.LANCZOS).crop(
+        ((nw - pw) // 2, (nh - ph) // 2, (nw - pw) // 2 + pw, (nh - ph) // 2 + ph))
+    card.paste(photo, (fx0 + 18, fy0 + 18))
 
-    # Name
-    pcx = px + pw // 2
-    draw.text((pcx, py + ph + 22), "SPECIAL AGENT", font=f_sa, fill=NAVY, anchor="mm")
+    # Vertical member code (reads top-to-bottom)
+    f_v = _fit(code, _display, 210, 40)
+    tb = d.textbbox((0, 0), code, font=f_v)
+    tile = Image.new("RGBA", (tb[2] - tb[0] + 4, tb[3] - tb[1] + 4), (0, 0, 0, 0))
+    ImageDraw.Draw(tile).text((2 - tb[0], 2 - tb[1]), code, font=f_v, fill=BLACK)
+    tile = tile.rotate(-90, expand=True)
+    card.paste(tile, (1000 - tile.width // 2, 300 - tile.height // 2), tile)
+
+    # Rank + name
+    col_w = fx1 - fx0 + 10
+    cx = (fx0 + fx1) // 2
+    _text(d, "SPECIAL AGENT", _fit("SPECIAL AGENT", _display, col_w, 70), cx, 508, BLACK, "c")
     name = display_name.upper()
-    name_font, nb = _fit_name(name, pw + 40, draw)
-    nw = nb[2] - nb[0]
-    draw.text((pcx - nw // 2, py + ph + 44), name, font=name_font, fill=NAVY)
-    draw.line([(pcx - nw // 2, py + ph + 52 + nb[3]), (pcx + nw // 2, py + ph + 52 + nb[3])],
-              fill=NAVY, width=1)
+    _text(d, name, _fit(name, _display, col_w, 70, 22), cx, 578, BLACK, "c")
 
-    # Certification
-    cert = ("THIS IS TO CERTIFY THAT THE HOLDER IS AN OFFICIAL MEMBER "
-            "OF THE FELLAS BEING IDIOTS DISCORD COMMUNITY.")
-    wrapped = _wrap_text(cert, f_cert, 640, draw)
-    draw.text((60, 442), "CERTIFICATION", font=_load_font(FONT_BOLD, 10), fill=NAVY)
-    for i, line in enumerate(wrapped):
-        draw.text((60, 460 + i * 17), line, font=f_cert, fill=TEXT_DARK)
-    sy = 460 + len(wrapped) * 17 + 30
-    draw.line([(60, sy), (280, sy)], fill=NAVY, width=1)
-    draw.text((60, sy + 4), "DIRECTOR, FELLAS BEING IDIOTS", font=f_tiny, fill=NAVY_MID)
+    # Certify text (typewriter, wide tracking)
+    f_c = _type(19)
+    for i, line in enumerate(("THIS IS TO CERTIFY THAT THE HOLDER",
+                              "IS AN OFFICIAL MEMBER OF THE",
+                              "FELLAS BEING IDIOTS")):
+        _spaced(d, line, f_c, 40, 408 + i * 47, BLACK, track=4)
 
-    # Vertical code + barcode
-    _draw_vertical_text(card, code, W - 42, 310, f_vert, NAVY, gap=1)
-    bc_x, bc_y, bc_w, bc_h = 775, 535, 220, 55
-    draw.text((bc_x, bc_y - 16), "MEMBER ID", font=_load_font(FONT_BOLD, 10), fill=NAVY)
-    _draw_barcode(card, bc_x, bc_y, bc_w, bc_h, _code_seed(code))
-    bbox = draw.textbbox((0, 0), code, font=f_code)
-    draw.text((bc_x + bc_w // 2 - (bbox[2] - bbox[0]) // 2, bc_y + bc_h + 8),
-              code, font=f_code, fill=NAVY)
+    # Barcode + code
+    _draw_barcode(d, 40, 548, 480, 68, code)
+    _spaced(d, code, _type(22), 40, 624, BLACK, track=3)
 
-    # Footer
-    draw.line([(40, H - 55), (W - 40, H - 55)], fill=NAVY, width=1)
-    disc = "FICTIONAL DISCORD COMMUNITY PARODY CARD  •  NOT A GOVERNMENT CREDENTIAL"
-    bbox = draw.textbbox((0, 0), disc, font=f_tiny)
-    draw.text(((W - (bbox[2] - bbox[0])) // 2, H - 40), disc, font=f_tiny, fill=NAVY_MID)
+    # Rounded corners
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, W - 1, H - 1], radius=34, fill=255)
+    out = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    out.paste(card, (0, 0), mask)
 
     buf = io.BytesIO()
-    card.convert("RGB").save(buf, format="PNG", optimize=True)
+    out.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 
